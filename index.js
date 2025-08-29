@@ -9,6 +9,7 @@ const util = require('util');
 
 const { isF1tvUrl, isRace } = require('./lib/f1tv-validator');
 const { getContentInfo, getContentStreamUrl, getAdditionalStreamsInfo, getContentParams, saveF1tvToken, getProgramStreamId, checkManualCookies } = require('./lib/f1tv-api');
+const { DownloadQueue } = require('./lib/download-queue');
 
 const getSessionChannelList = (url) => {
     getContentInfo(url)
@@ -41,6 +42,157 @@ const getTokenizedUrl = async (url, content, channel) => {
     return f1tvUrl;
 };
 
+const handleQueueDownloads = async (options) => {
+    const {
+        url, queueFile, parallel, delay, retryAttempts,
+        channel, internationalAudio, itsoffset, audioStream,
+        videoSize, format, outputDirectory,
+        f1Username, f1Password
+    } = options;
+
+    // Safety warnings for parallel downloads
+    if (parallel > 1) {
+        log.warn('\n' + '⚠️ '.repeat(20));
+        log.warn('⚠️  PARALLEL DOWNLOADS WARNING');
+        log.warn('⚠️  Parallel downloads may violate F1TV Terms of Service');
+        log.warn('⚠️  This could result in account suspension or rate limiting');
+        log.warn('⚠️  Use at your own risk!');
+        log.warn('⚠️ '.repeat(20) + '\n');
+        
+        if (delay < 30) {
+            log.warn('⚠️  RECOMMENDATION: Use --delay 30 or higher with parallel downloads');
+        }
+        
+        // Require user confirmation for parallel downloads
+        const confirmation = await inquirer.prompt([{
+            type: 'confirm',
+            name: 'proceed',
+            message: 'Do you understand the risks and wish to proceed with parallel downloads?',
+            default: false
+        }]);
+        
+        if (!confirmation.proceed) {
+            log.info('Cancelled by user. Use --parallel 1 for safe sequential downloads.');
+            return;
+        }
+    }
+
+    // Ensure authentication is available before starting queue
+    try {
+        const manualToken = checkManualCookies();
+        if (!manualToken && (!f1Username || !f1Password)) {
+            if (!f1Username || !f1Password) {
+                log.info('Authentication required for queue downloads...');
+                const userPrompt = await inquirer.prompt([
+                    {
+                        type: 'input',
+                        name: 'f1Username',
+                        message: 'Enter your F1TV user name:',
+                        default: f1Username
+                    },
+                    {
+                        type: 'password',
+                        name: 'f1Password', 
+                        message: 'Enter your F1TV password:',
+                        default: f1Password
+                    }
+                ]);
+                f1Username = userPrompt.f1Username;
+                f1Password = userPrompt.f1Password;
+            }
+            
+            if (!f1Username || !f1Password) {
+                throw new Error('Authentication required for downloads');
+            }
+            
+            log.info('Pre-authenticating for queue downloads...');
+            await saveF1tvToken(f1Username, f1Password);
+        }
+    } catch (error) {
+        log.error('Authentication failed:', error.message);
+        return;
+    }
+
+    // Create download queue
+    const queue = new DownloadQueue({
+        maxConcurrent: parallel,
+        delay: delay,
+        retryAttempts: retryAttempts
+    });
+
+    // Add event listeners for progress reporting
+    queue.on('taskStarted', (task) => {
+        log.info(`📋 Queue Status: ${queue.active.length} active, ${queue.queue.length} pending`);
+    });
+    
+    queue.on('taskCompleted', (task) => {
+        const status = queue.getStatus();
+        log.info(`📋 Progress: ${status.completedDownloads}/${status.completedDownloads + status.failedDownloads + status.queueLength + status.activeDownloads} completed`);
+    });
+    
+    queue.on('queueCompleted', (summary) => {
+        if (summary.failed > 0) {
+            log.info('\n💡 TIP: Failed downloads may be due to rate limiting. Try:');
+            log.info('  - Using --parallel 1 for sequential downloads');
+            log.info('  - Increasing --delay to 60+ seconds');
+            log.info('  - Running node clear-cache.js to reset authentication');
+        }
+    });
+
+    // Collect URLs to download
+    const urls = [];
+    
+    if (queueFile) {
+        // Read URLs from file
+        try {
+            const fs = require('fs');
+            const fileContent = fs.readFileSync(queueFile, 'utf8');
+            const fileUrls = fileContent
+                .split('\n')
+                .map(line => line.trim())
+                .filter(line => line && !line.startsWith('#') && isF1tvUrl(line));
+            
+            urls.push(...fileUrls);
+            log.info(`📁 Loaded ${urls.length} URLs from ${queueFile}`);
+        } catch (error) {
+            log.error(`Failed to read queue file ${queueFile}:`, error.message);
+            return;
+        }
+    } else if (url) {
+        // Single URL
+        urls.push(url);
+    }
+
+    if (urls.length === 0) {
+        log.error('No valid F1TV URLs found to download');
+        return;
+    }
+
+    // Add all downloads to queue
+    urls.forEach(downloadUrl => {
+        queue.addDownload({
+            url: downloadUrl,
+            channel,
+            outputDirectory,
+            audioStream,
+            videoSize,
+            format,
+            internationalAudio,
+            itsoffset
+        });
+    });
+
+    log.info(`\n🚀 Starting queue with ${urls.length} downloads`);
+    log.info(`⚙️  Settings: ${parallel} parallel, ${delay}s delay, ${retryAttempts} retries`);
+    
+    // Start the queue and wait for completion
+    return new Promise((resolve, reject) => {
+        queue.on('queueCompleted', () => resolve());
+        queue.on('error', reject);
+        queue.start();
+    });
+};
+
 (async () => {
     try {
         let {
@@ -56,14 +208,20 @@ const getTokenizedUrl = async (url, content, channel) => {
             username: f1Username,
             password: f1Password,
             streamUrl: streamUrl,
-            logLevel: logLevel
+            logLevel: logLevel,
+            parallel: parallel,
+            delay: delay,
+            queueFile: queueFile,
+            retryAttempts: retryAttempts
         } = yargs
-            .command('$0 <url>', 'Download a video', (yarg) => {
+            .command('$0 <url>', 'Download F1TV videos (supports parallel downloads and queues)', (yarg) => {
                 yarg
                     .positional('url', {
                         type: 'string',
-                        desc: 'The f1tv url for the video',
+                        desc: 'The F1TV URL for the video (optional if using --queue-file)',
                         coerce: urlStr => {
+                            // Allow dummy URL when using queue-file
+                            if (!urlStr || urlStr === 'queue') return 'queue';
                             if (isF1tvUrl(urlStr)) {
                                 return urlStr;
                             }
@@ -155,6 +313,41 @@ const getTokenizedUrl = async (url, content, channel) => {
                         choices: ['trace', 'debug', 'info', 'warn', 'error'],
                         default: 'info'
                     })
+                    .option('parallel', {
+                        type: 'number',
+                        desc: 'Number of parallel downloads (WARNING: Values > 1 may violate F1TV ToS)',
+                        alias: 'p',
+                        default: 1,
+                        coerce: value => {
+                            if (value < 1) throw new Error('Parallel count must be at least 1');
+                            if (value > 3) {
+                                console.warn('⚠️  WARNING: Limiting parallel downloads to 3 for safety');
+                                return 3;
+                            }
+                            return Math.floor(value);
+                        }
+                    })
+                    .option('delay', {
+                        type: 'number',
+                        desc: 'Delay between downloads in seconds (recommended: 30+ for parallel downloads)',
+                        alias: 'd',
+                        default: 30,
+                        coerce: value => {
+                            if (value < 0) throw new Error('Delay must be non-negative');
+                            return Math.max(0, Math.floor(value));
+                        }
+                    })
+                    .option('queue-file', {
+                        type: 'string',
+                        desc: 'File containing F1TV URLs to download (one per line)',
+                        alias: 'q'
+                    })
+                    .option('retry-attempts', {
+                        type: 'number',
+                        desc: 'Number of retry attempts for failed downloads',
+                        default: 3,
+                        coerce: value => Math.max(1, Math.min(10, Math.floor(value)))
+                    })
             })
             .demandCommand()
             .showHelpOnFail()
@@ -164,6 +357,17 @@ const getTokenizedUrl = async (url, content, channel) => {
 
         if (channelList) return getSessionChannelList(url);
 
+        // Handle queue file or parallel downloads
+        if (queueFile || parallel > 1) {
+            return await handleQueueDownloads({
+                url: url === 'queue' ? null : url, queueFile, parallel, delay, retryAttempts,
+                channel, internationalAudio, itsoffset, audioStream, 
+                videoSize, format, outputDirectory: outputDir,
+                f1Username, f1Password
+            });
+        }
+
+        // Single download mode (original logic)
         const content = await getContentInfo(url);
 
         let f1tvUrl = '';

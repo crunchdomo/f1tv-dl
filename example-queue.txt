@@ -1,0 +1,16 @@
+# F1TV Download Queue File Example
+# Lines starting with # are comments and will be ignored
+# Put one F1TV URL per line
+
+# Example F1TV URLs (these are fictional examples - replace with real URLs):
+# https://f1tv.formula1.com/detail/1000001234/2024-bahrain-grand-prix?action=play
+# https://f1tv.formula1.com/detail/1000001235/2024-saudi-arabian-grand-prix?action=play
+# https://f1tv.formula1.com/detail/1000001236/2024-australian-grand-prix?action=play
+
+# Usage:
+# node index.js --queue-file example-queue.txt --parallel 2 --delay 60
+
+# Safety recommendations:
+# - Use --parallel 1 for maximum safety (sequential downloads)
+# - Use --delay 30+ seconds between downloads to avoid rate limiting
+# - Monitor for any HTTP 429 (rate limit) errors
