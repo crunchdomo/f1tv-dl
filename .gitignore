@@ -17,3 +17,4 @@ docker-compose*.yml
 .DS_Store
 .vscode
 data
+.f1tv-cookies.json
